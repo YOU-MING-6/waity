@@ -2,7 +2,7 @@
 Waity - 基于 PySide6 + QFluentWidgets 的定时关机提示工具。
 
 行为：
-    - 启动后立即显示置顶的提醒对话框（首次显示时屏幕居中）；
+    - 启动后立即显示置顶的提醒对话框（首次显示时屏幕居中，带窗口阴影）；
     - 对话框可拖动；
     - 平滑倒计时进度条；
     - 点“延迟 1 分钟”固定 +60 秒，不关闭窗口；
@@ -16,10 +16,10 @@ from PySide6.QtCore import (
     Qt, QTimer, QVariantAnimation, QEasingCurve, QPoint, QProcess,
     QLockFile, QStandardPaths,
 )
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QColor, QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QSystemTrayIcon,
+    QApplication, QWidget, QSystemTrayIcon, QGraphicsDropShadowEffect,
     QVBoxLayout, QHBoxLayout, QFrame,
 )
 
@@ -38,13 +38,19 @@ APP_NAME = "Waity"
 SOCKET_NAME = "waity_socket"
 ICON_FILE = "icon.png"
 
-WIDTH = 600                      # 对话框宽度
+WIDTH = 600                      # 对话框内容宽度
 TICK_MS = 1000                   # 倒计时 / 进度条动画步长
 CLOSE_DELAY_MS = 500             # 关闭对话框后退出前的延迟
 SHUTDOWN_BUFFER_S = 5            # “立即关机”缓冲
 DELAY_S = 60                     # 每次延迟增加的秒数
 NOTIFY_TIMEOUT_MS = 500          # 单实例消息超时
 LOCK_TIMEOUT_MS = 100            # 单实例加锁超时
+
+# 窗口阴影
+SHADOW_MARGIN = 24               # 窗口四周为阴影预留的透明边距（px）
+SHADOW_BLUR = 24                 # 阴影模糊半径
+SHADOW_OFFSET_Y = 4              # 阴影向下偏移
+SHADOW_COLOR = QColor(0, 0, 0, 90)   # 阴影颜色（半透明黑）
 
 
 # ==================================================================
@@ -120,10 +126,10 @@ class SingleInstance:
 
 
 # ==================================================================
-# ShutdownMessageBox（独立顶层窗口，无遮罩）
+# ShutdownMessageBox（独立顶层窗口，无遮罩，带阴影）
 # ==================================================================
 class ShutdownMessageBox(QWidget):
-    """关机提示对话框：圆角、可拖动、含平滑进度条。"""
+    """关机提示对话框：圆角、可拖动、带窗口阴影、含平滑进度条。"""
 
     def __init__(self, countdown: int) -> None:
         super().__init__()
@@ -142,15 +148,22 @@ class ShutdownMessageBox(QWidget):
         self.setWindowFlags(
             Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
         )
+        # 透明背景仅用于让阴影边距与圆角外的区域真正透明
         self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setFixedWidth(WIDTH)
 
+        # 外层留出阴影边距
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(
+            SHADOW_MARGIN, SHADOW_MARGIN, SHADOW_MARGIN, SHADOW_MARGIN
+        )
+
+        # 圆角背景容器
         self.container = QFrame(self)
         self.container.setObjectName("shutdownContainer")
+        self.container.setFixedWidth(WIDTH)
         self._apply_style()
+        self._attach_shadow()
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(self.container)
 
     def _apply_style(self) -> None:
@@ -162,6 +175,14 @@ class ShutdownMessageBox(QWidget):
             f"#shutdownContainer {{ background-color: {bg};"
             f" border: 1px solid {border}; border-radius: 8px; }}"
         )
+
+    def _attach_shadow(self) -> None:
+        """为圆角容器挂上系统风格的柔和阴影。"""
+        shadow = QGraphicsDropShadowEffect(self.container)
+        shadow.setBlurRadius(SHADOW_BLUR)
+        shadow.setOffset(0, SHADOW_OFFSET_Y)
+        shadow.setColor(SHADOW_COLOR)
+        self.container.setGraphicsEffect(shadow)
 
     # ---------- 内容 ----------
     def _setup_content(self) -> None:
