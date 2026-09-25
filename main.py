@@ -2,18 +2,22 @@
 Waity - 基于 PySide6 + QFluentWidgets 的定时关机提示工具。
 
 行为：
-    - 启动后立即显示置顶的提醒对话框（无全屏遮罩）；
+    - 启动后立即显示置顶的提醒对话框（无全屏遮罩，首次显示时屏幕居中）；
     - 点击对话框阴影区域会有提示音 + 抖动反馈；
-    - 托盘常驻，可随时唤起 / 延迟 / 取消。
+    - 对话框可拖动（按住标题/空白区域拖动）；
+    - 内含倒计时进度条；
+    - 点“延迟”弹出数字输入框，窗口居中；
+    - 托盘常驻，单击图标重新显示对话框。
 
 分层：
-    Config          - 常量集中管理
-    Utils           - 与 UI 无关的工具函数
-    SingleInstance  - 单实例控制（QLockFile + QLocalSocket）
-    ShutdownMessageBox - 关机提示对话框
-    TrayIcon        - 系统托盘
-    MainWindow      - 不可见的控制器宿主（协调对话框 / 托盘 / 定时器）
-    main()          - 参数解析与启动
+    Config              - 常量集中管理
+    Utils               - 与 UI 无关的工具函数
+    SingleInstance      - 单实例控制（QLockFile + QLocalSocket）
+    ShutdownMessageBox  - 关机提示对话框（含进度条、拖动）
+    DelayInputDialog    - 延迟时长输入对话框
+    TrayIcon            - 系统托盘
+    MainWindow          - 不可见控制器宿主
+    main()              - 参数解析与启动
 """
 import os
 import sys
@@ -21,7 +25,7 @@ import time
 import argparse
 
 from PySide6.QtCore import (
-    Qt, QTimer, QPropertyAnimation, QPoint,
+    Qt, QTimer, QPropertyAnimation, QPoint, QEvent, QProcess,
     QLockFile, QStandardPaths,
 )
 from PySide6.QtGui import QIcon
@@ -30,8 +34,9 @@ from PySide6.QtWidgets import QApplication, QWidget, QSystemTrayIcon
 
 from qfluentwidgets import (
     Action, BodyLabel, FluentIcon, InfoBar, InfoBarPosition,
-    MessageBoxBase, PrimaryPushButton, PushButton, SubtitleLabel,
-    SystemTrayMenu, Theme, setTheme, setThemeColor,
+    MessageBoxBase, PrimaryPushButton, ProgressBar, PushButton,
+    SpinBox, SubtitleLabel, SystemTrayMenu,
+    Theme, setTheme, setThemeColor,
 )
 from qframelesswindow.utils import getSystemAccentColor
 
@@ -44,7 +49,8 @@ SOCKET_NAME = "waity_single_instance_socket"
 LOCK_FILE_NAME = "waity_single_instance.lock"
 ICON_FILE_NAME = "icon.png"
 
-MESSAGE_BOX_WIDTH = 580          # 对话框固定宽度
+MESSAGE_BOX_WIDTH = 580          # 主对话框固定宽度
+DELAY_DIALOG_WIDTH = 380         # 延迟输入对话框固定宽度
 SHAKE_DURATION_MS = 500          # 抖动动画时长
 DIALOG_CLOSE_DELAY_MS = 500      # 关闭对话框后的延迟（等待关闭动画）
 IMMEDIATE_SHUTDOWN_DELAY = 5     # “立即关机”前保留的缓冲秒数
@@ -52,6 +58,10 @@ NOTIFY_TIMEOUT_MS = 500          # 单实例消息等待超时
 LOCK_ACQUIRE_TIMEOUT_MS = 100    # 尝试获取锁的超时
 LOCK_RETRY_INTERVAL_S = 0.1      # --overwrite 时轮询获取锁的间隔
 LOCK_RETRY_TOTAL_S = 3.0         # --overwrite 时等待旧实例退出的最长时间
+
+DELAY_MIN_S = 1                  # 延迟输入最小值（秒）
+DELAY_MAX_S = 24 * 3600          # 延迟输入最大值（秒，1 天）
+DELAY_STEP_S = 60                # 延迟输入步进（秒）
 
 
 # ==================================================================
@@ -77,18 +87,24 @@ def format_time(seconds: int) -> str:
 
 
 def run_shutdown(force: bool = False, delay: int = 0) -> None:
-    """执行系统关机命令。"""
+    """
+    异步执行系统关机命令。
+    使用 QProcess.startDetached 避免 os.system 阻塞主线程导致的 UI 冻结。
+    """
     if sys.platform == "win32":
-        force_flag = "/f" if force else ""
-        os.system(f"shutdown /s {force_flag} /t {delay}".strip())
+        args = ["/s"]
+        if force:
+            args.append("/f")
+        args += ["/t", str(delay)]
+        QProcess.startDetached("shutdown", args)
     else:
-        os.system(f"shutdown -h -t {delay}")
+        QProcess.startDetached("shutdown", ["-h", "-t", str(delay)])
 
 
 def cancel_system_shutdown() -> None:
-    """取消系统已经计划的关机（Windows）。"""
+    """异步取消系统已经计划的关机（Windows）。"""
     if sys.platform == "win32":
-        os.system("shutdown /a")
+        QProcess.startDetached("shutdown", ["/a"])
 
 
 def system_beep() -> None:
@@ -98,6 +114,18 @@ def system_beep() -> None:
         winsound.MessageBeep()
     else:
         QApplication.beep()
+
+
+def center_widget_on_screen(widget: QWidget) -> None:
+    """将顶层 widget 居中到它所在的（或当前主）屏幕的可用区域。"""
+    screen = widget.screen() or QApplication.primaryScreen()
+    if screen is None:
+        return
+    geo = screen.availableGeometry()
+    widget.adjustSize()
+    x = geo.x() + (geo.width() - widget.width()) // 2
+    y = geo.y() + (geo.height() - widget.height()) // 2
+    widget.move(x, y)
 
 
 # ==================================================================
@@ -123,14 +151,12 @@ class SingleInstance:
         self._lock = QLockFile(lock_path)
 
     def acquire(self) -> bool:
-        """尝试获取锁；返回 False 表示已有实例在运行。"""
         return self._lock.tryLock(LOCK_ACQUIRE_TIMEOUT_MS)
 
     def release(self) -> None:
         self._lock.unlock()
 
     def notify_existing(self, message: str) -> bool:
-        """向已存在的实例发送消息，返回是否成功。"""
         socket = QLocalSocket()
         socket.connectToServer(self.socket_name)
         if not socket.waitForConnected(NOTIFY_TIMEOUT_MS):
@@ -141,7 +167,6 @@ class SingleInstance:
         return True
 
     def wait_for_release(self) -> bool:
-        """在 --overwrite 场景下，轮询等待旧实例释放锁。"""
         deadline = time.monotonic() + LOCK_RETRY_TOTAL_S
         while time.monotonic() < deadline:
             if self.acquire():
@@ -151,18 +176,65 @@ class SingleInstance:
 
 
 # ==================================================================
+# DelayInputDialog
+# ==================================================================
+class DelayInputDialog(MessageBoxBase):
+    """延迟时长输入对话框（数字输入框）。"""
+
+    def __init__(
+        self,
+        parent,
+        default_seconds: int = 180,
+        min_seconds: int = DELAY_MIN_S,
+        max_seconds: int = DELAY_MAX_S,
+        step_seconds: int = DELAY_STEP_S,
+    ) -> None:
+        super().__init__(parent)
+        self.widget.setFixedWidth(DELAY_DIALOG_WIDTH)
+
+        self.titleLabel = SubtitleLabel("延迟关机", self)
+        self.contentLabel = BodyLabel("请输入延迟时长（秒）：", self)
+
+        self.spinBox = SpinBox(self)
+        self.spinBox.setRange(min_seconds, max_seconds)
+        self.spinBox.setSingleStep(step_seconds)
+        self.spinBox.setValue(default_seconds)
+        self.spinBox.setSuffix(" 秒")
+
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(self.contentLabel)
+        self.viewLayout.addSpacing(8)
+        self.viewLayout.addWidget(self.spinBox)
+
+        self.yesButton.setText("确定")
+        self.cancelButton.setText("取消")
+
+    def get_value(self) -> int:
+        return self.spinBox.value()
+
+
+# ==================================================================
 # ShutdownMessageBox
 # ==================================================================
 class ShutdownMessageBox(MessageBoxBase):
-    """关机提示对话框（顶层置顶显示）。"""
+    """
+    关机提示对话框（顶层置顶显示）。
+    - 内置进度条显示剩余时间占初始总时长的比例；
+    - 按住对话框非按钮区域可拖动窗口。
+    """
 
     def __init__(self, args: argparse.Namespace, parent=None) -> None:
         super().__init__(parent)
         self.args = args
         self.remaining: int = args.countdown
+        self.total: int = args.countdown
         self._shake_anim: QPropertyAnimation | None = None
+        self._drag_offset: QPoint | None = None
 
         self.widget.setFixedWidth(MESSAGE_BOX_WIDTH)
+        # 拖动：在 widget（及其未消费鼠标事件的子控件）上做事件过滤
+        self.widget.installEventFilter(self)
+
         self._setup_content()
         self._setup_buttons()
         self.update_content()
@@ -173,19 +245,21 @@ class ShutdownMessageBox(MessageBoxBase):
         self.contentLabel = BodyLabel("", self)
         self.contentLabel.setWordWrap(True)
 
+        self.progressBar = ProgressBar(self)
+        self.progressBar.setValue(100)
+
         self.viewLayout.addWidget(self.titleLabel)
         self.viewLayout.addWidget(self.contentLabel)
+        self.viewLayout.addSpacing(10)
+        self.viewLayout.addWidget(self.progressBar)
 
     def _setup_buttons(self) -> None:
-        # 隐藏 MessageBoxBase 的默认按钮，使用自定义布局
         self.yesButton.hide()
         self.cancelButton.hide()
 
         self.accept_btn = PrimaryPushButton(FluentIcon.ACCEPT, "已阅", self)
         self.shutdown_btn = PushButton(FluentIcon.POWER_BUTTON, "立即关机", self)
-        self.delay_btn = PushButton(
-            FluentIcon.DATE_TIME, f"延迟{format_time(self.args.delay)}", self
-        )
+        self.delay_btn = PushButton(FluentIcon.DATE_TIME, "延迟…", self)
         self.cancel_btn = PushButton(FluentIcon.CLOSE, "取消关机计划", self)
 
         # 次要操作在左，主操作在右（符合 Fluent 视觉习惯）
@@ -198,16 +272,48 @@ class ShutdownMessageBox(MessageBoxBase):
         if self.args.hide_cancel:
             self.cancel_btn.hide()
 
-    # ---------- 内容更新 ----------
-    def update_content(self, remaining: int | None = None) -> None:
+    # ---------- 内容 / 进度更新 ----------
+    def update_content(
+        self, remaining: int | None = None, total: int | None = None
+    ) -> None:
         if remaining is not None:
             self.remaining = remaining
+        if total is not None:
+            self.total = total
+
         self.contentLabel.setText(
             f"计算机将在{format_time(self.remaining)}后自动关闭。"
             "请及时保存您的工作或选择其他操作。"
         )
+        self._update_progress()
 
-    # ---------- 交互：点击对话框阴影区域时的反馈 ----------
+    def _update_progress(self) -> None:
+        if self.total <= 0:
+            self.progressBar.setValue(0)
+            return
+        value = int(round(self.remaining * 100 / self.total))
+        self.progressBar.setValue(max(0, min(100, value)))
+
+    # ---------- 拖动 ----------
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.widget:
+            et = event.type()
+            if et == QEvent.Type.MouseButtonPress and event.button() == Qt.LeftButton:
+                self._drag_offset = (
+                    event.globalPosition().toPoint()
+                    - self.frameGeometry().topLeft()
+                )
+            elif et == QEvent.Type.MouseMove and self._drag_offset is not None:
+                if event.buttons() & Qt.LeftButton:
+                    self.move(
+                        event.globalPosition().toPoint() - self._drag_offset
+                    )
+                    return True
+            elif et == QEvent.Type.MouseButtonRelease:
+                self._drag_offset = None
+        return super().eventFilter(obj, event)
+
+    # ---------- 点击阴影区域反馈 ----------
     def mousePressEvent(self, event) -> None:
         clicked_outside = not self.widget.geometry().contains(
             event.position().toPoint()
@@ -218,14 +324,12 @@ class ShutdownMessageBox(MessageBoxBase):
 
     # ---------- 公共反馈：提示音 + 抖动 ----------
     def play_feedback(self) -> None:
-        """触发提示音和抖动。"""
         if not self.args.no_beep:
             system_beep()
         if not self.args.no_shake:
             self.play_shake()
 
     def play_shake(self) -> None:
-        """复用同一个动画对象，避免反复 new 造成的内存堆积。"""
         if self._shake_anim and self._shake_anim.state() == QPropertyAnimation.Running:
             self._shake_anim.stop()
             self.widget.move(self._shake_anim.startValue())
@@ -261,13 +365,12 @@ class TrayIcon(QSystemTrayIcon):
         self.menu.addAction(self.time_action)
         self.menu.addSeparator()
 
-        delay_action = Action(
+        self.menu.addAction(Action(
             FluentIcon.DATE_TIME,
-            f"延迟{format_time(controller.args.delay)}",
+            "延迟…",
             controller,
-            triggered=controller.apply_delay,
-        )
-        self.menu.addAction(delay_action)
+            triggered=controller.show_delay_dialog,
+        ))
 
         if not controller.args.hide_cancel:
             self.menu.addAction(Action(
@@ -291,16 +394,18 @@ class TrayIcon(QSystemTrayIcon):
 class MainWindow(QWidget):
     """
     应用主控制器。
-
-    本窗口不显示任何内容，仅作为 MessageBox / Tray / Server / Timer 的宿主。
-    启动后立即以置顶方式显示 MessageBox。
+    本窗口不显示内容，仅作为 MessageBox / Tray / Server / Timer 的宿主。
+    启动后立即显示置顶的 MessageBox（首次显示时屏幕居中）。
     """
 
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__()
         self.args = args
         self.remaining: int = args.countdown
+        self.total: int = args.countdown
         self._reminder_fired: bool = False
+        # 首次显示时做一次屏幕居中；此后保留用户拖动后的位置
+        self._message_box_centered: bool = False
 
         self._setup_window()
         self._setup_theme()
@@ -314,12 +419,11 @@ class MainWindow(QWidget):
 
     # ---------- 初始化 ----------
     def _setup_window(self) -> None:
-        """设置宿主窗口属性——仅用于承载图标 / 作为 parent，不显示。"""
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(QIcon(get_resource_path(ICON_FILE_NAME)))
         self.setWindowFlags(Qt.Tool)
         self.resize(1, 1)
-        # 注意：不要调用 show() / showFullScreen()
+        # 注意：不要 show()，仅作为不可见宿主
 
     def _setup_theme(self) -> None:
         setTheme(Theme.AUTO)
@@ -329,7 +433,6 @@ class MainWindow(QWidget):
     def _setup_message_box(self) -> None:
         self.message_box = ShutdownMessageBox(self.args, parent=self)
 
-        # 让弹窗独立置顶；根据 --show-in-taskbar 决定是否隐藏任务栏图标
         flags = self.message_box.windowFlags() | Qt.WindowStaysOnTopHint
         if not self.args.show_in_taskbar:
             flags |= Qt.Tool
@@ -337,7 +440,7 @@ class MainWindow(QWidget):
 
         self.message_box.accept_btn.clicked.connect(self.on_accept)
         self.message_box.shutdown_btn.clicked.connect(self.on_shutdown_now)
-        self.message_box.delay_btn.clicked.connect(self.on_delay_clicked)
+        self.message_box.delay_btn.clicked.connect(self.show_delay_dialog)
         self.message_box.cancel_btn.clicked.connect(self.cancel_shutdown)
 
     def _setup_tray(self) -> None:
@@ -348,7 +451,7 @@ class MainWindow(QWidget):
 
     def _setup_server(self) -> None:
         self.server = QLocalServer(self)
-        self.server.removeServer(SOCKET_NAME)   # 清理异常退出的残留
+        self.server.removeServer(SOCKET_NAME)
         self.server.listen(SOCKET_NAME)
         self.server.newConnection.connect(self._on_new_connection)
 
@@ -386,14 +489,16 @@ class MainWindow(QWidget):
 
     # ---------- 托盘交互 ----------
     def on_tray_activated(self, reason) -> None:
-        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
             self.show_reminder()
 
     # ---------- 倒计时 ----------
     def _tick(self) -> None:
         self.remaining -= 1
 
-        # 使用标记位而非相等判断，避免边界竞态
         if not self._reminder_fired and self.remaining <= self.args.reminder:
             self._reminder_fired = True
             self.show_reminder()
@@ -405,18 +510,26 @@ class MainWindow(QWidget):
             self.perform_shutdown()
 
     def _refresh_ui(self) -> None:
-        self.message_box.update_content(self.remaining)
+        self.message_box.update_content(self.remaining, self.total)
         self.tray.update_remaining(self.remaining)
 
     # ---------- 显示 / 隐藏 ----------
     def show_reminder(self) -> None:
-        """显示并置顶提醒对话框。"""
+        """
+        显示并置顶提醒对话框。
+        首次显示前先 adjustSize + move 居中，避免 show() 之后被窗口管理器
+        覆盖默认位置导致的“没有居中”现象。
+        """
+        if not self._message_box_centered:
+            # show 之前先计算尺寸并居中；此时 MessageBoxBase 的布局已完成
+            center_widget_on_screen(self.message_box)
+            self._message_box_centered = True
+
         self.message_box.show()
         self.message_box.raise_()
         self.message_box.activateWindow()
 
     def _close_message_box(self) -> None:
-        """关闭提醒对话框（等待关闭动画完成后再做后续处理）。"""
         if self.message_box.isVisible():
             self.message_box.close()
 
@@ -426,42 +539,57 @@ class MainWindow(QWidget):
         self._close_message_box()
 
     def on_shutdown_now(self) -> None:
-        """立即关机（保留短暂缓冲，避免误触）。"""
+        """立即关机（保留短暂缓冲）。"""
         if hasattr(self, "timer") and self.timer.isActive():
             self.timer.stop()
         self.perform_shutdown(delay=IMMEDIATE_SHUTDOWN_DELAY)
 
-    def on_delay_clicked(self) -> None:
-        """对话框上的「延迟」按钮：延迟 + 关闭对话框。"""
-        self.apply_delay()
-        self._close_message_box()
+    def show_delay_dialog(self) -> None:
+        """弹出数字输入框，询问延迟时长；确定后应用。"""
+        dialog = DelayInputDialog(
+            parent=self.message_box,
+            default_seconds=self.args.delay,
+        )
+        # MessageBoxBase.exec() 内部自带居中逻辑；这里保留手动居中作为兜底
+        center_widget_on_screen(dialog)
 
-    def apply_delay(self) -> None:
-        """延长倒计时 delay 秒（不改变对话框可见性）。"""
+        if dialog.exec():
+            seconds = dialog.get_value()
+            self.apply_delay(seconds)
+            if self.message_box.isVisible():
+                self._close_message_box()
+
+    def apply_delay(self, seconds: int) -> None:
+        """延长倒计时 seconds 秒（不改变对话框可见性）。"""
         if hasattr(self, "timer") and self.timer.isActive():
-            self.remaining += self.args.delay
+            self.remaining += seconds
+            self.total += seconds
         else:
-            self.remaining = self.args.delay
+            self.remaining = seconds
+            self.total = seconds
             self.timer = QTimer(self)
             self.timer.timeout.connect(self._tick)
             self.timer.start(1000)
 
-        # 延迟后重新评估是否允许再次触发提醒
         self._reminder_fired = self.remaining <= self.args.reminder
         self._refresh_ui()
 
     # ---------- 关机 / 取消 ----------
     def perform_shutdown(self, delay: int = 0) -> None:
+        # run_shutdown 已经异步执行，不会阻塞 UI
         run_shutdown(force=self.args.force, delay=delay)
 
     def cancel_shutdown(self) -> None:
-        """取消关机：撤销系统关机命令并退出应用。"""
+        """
+        取消关机：异步撤销系统关机命令，关闭对话框并退出应用。
+        由于 cancel_system_shutdown 与 run_shutdown 均为异步，
+        整个流程不会冻结 UI。
+        """
         cancel_system_shutdown()
         self._close_message_box()
         QTimer.singleShot(DIALOG_CLOSE_DELAY_MS, self.quit_app)
 
     def quit_app(self) -> None:
-        """干净退出：停定时器、隐藏托盘、关闭 server、释放锁、退出 QApplication。"""
         if hasattr(self, "timer") and self.timer.isActive():
             self.timer.stop()
         if hasattr(self, "tray"):
@@ -481,7 +609,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--countdown", type=int, default=60,
                         help="倒计时时长（秒），默认 60 秒")
     parser.add_argument("--delay", type=int, default=180,
-                        help="延迟选项时长（秒），默认 180 秒（3 分钟）")
+                        help="延迟选项默认时长（秒），默认 180 秒（3 分钟）")
     parser.add_argument("--reminder", type=int, default=60,
                         help="关机前再次提醒的时长（秒），默认 60 秒")
     parser.add_argument("--show-in-taskbar", action="store_true",
@@ -505,7 +633,6 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 
 def _resolve_single_instance(args: argparse.Namespace, si: SingleInstance) -> None:
-    """处理单实例逻辑；返回时保证当前进程已持有锁。"""
     if si.acquire():
         return
 
@@ -532,8 +659,7 @@ def main() -> None:
     _resolve_single_instance(args, si)
 
     window = MainWindow(args)
-    window._single_instance = si   # 供 quit_app 释放锁
-    # 不需要 window.show()：MainWindow 只是不可见宿主
+    window._single_instance = si
     sys.exit(app.exec())
 
 
