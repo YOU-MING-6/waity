@@ -196,7 +196,7 @@ class ShutdownMessageBox(QWidget):
         self.progressBar = ProgressBar(self.container)
         self.progressBar.setValue(100)
 
-        layout.addWidget(SubtitleLabel("即将关机", self.container))
+        layout.addWidget(SubtitleLabel("要关机吗？", self.container))
         layout.addWidget(self.contentLabel)
         layout.addSpacing(4)
         layout.addWidget(self.progressBar)
@@ -230,8 +230,7 @@ class ShutdownMessageBox(QWidget):
             self.total = total
 
         self.contentLabel.setText(
-            f"计算机将在{format_time(self.remaining)}后自动关闭。"
-            "请及时保存您的工作或选择其他操作。"
+            f"当前为放学时段；计算机将在 {format_time(self.remaining)}后自动关闭。"
         )
         self._animate_progress(self._target_progress())
 
@@ -420,8 +419,8 @@ class MainWindow(QWidget):
 # ==================================================================
 def main() -> None:
     parser = argparse.ArgumentParser(description=APP_NAME)
-    parser.add_argument("--countdown", type=int, default=60,
-                        help="倒计时时长（秒），默认 60 秒")
+    parser.add_argument("--countdown", type=int, default=15,
+                        help="默认倒计时时长（秒）")
     args = parser.parse_args()
     if args.countdown <= 0:
         print("错误：--countdown 必须为大于 0 的整数")
