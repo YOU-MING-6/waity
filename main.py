@@ -5,7 +5,8 @@
     - 启动后立即显示置顶的提醒对话框；
     - 对话框可拖动；
     - 平滑倒计时进度条；
-    - 托盘常驻，单击图标重新显示对话框。
+    - 托盘常驻，单击图标重新显示对话框；
+    - 图标跟随深浅主题自动切换（icon.png / icon_night.png）。
 """
 import os
 import sys
@@ -26,7 +27,7 @@ from qfluentwidgets import (
     Action, BodyLabel, FluentIcon, PrimaryPushButton, ProgressBar,
     PushButton, SubtitleLabel, SystemTrayMenu, Theme,
     VBoxLayout, HBoxLayout, setCustomStyleSheet,
-    setTheme, setThemeColor,
+    setTheme, setThemeColor, isDarkTheme, qconfig,
 )
 from qframelesswindow.utils import getSystemAccentColor
 
@@ -37,7 +38,9 @@ from qframelesswindow.utils import getSystemAccentColor
 APP_ID = "shutdowntool"
 APP_NAME = "shutdowntool"
 APP_DESCRIPTION = "定时关机提示工具"
-ICON_FILE = "icon.png"
+
+ICON_FILE = "icon.png"                 # 浅色主题图标
+ICON_NIGHT_FILE = "icon_night.png"     # 深色主题图标
 
 # 派生标识：跟随 APP_ID，改名后不会再和旧实例抢锁
 SOCKET_NAME = f"{APP_ID}_socket"
@@ -67,9 +70,13 @@ _PROGRESS_SUPPORTS_DURATION = (
 # 工具
 # ==================================================================
 def resource_path(name: str) -> str:
-    """兼容 PyInstaller 与开发环境。"""
+    """兼容 PyInstaller 与开发环境；缺失时回落到 ICON_FILE。"""
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, name)
+    path = os.path.join(base, name)
+    if os.path.exists(path):
+        return path
+    fallback = os.path.join(base, ICON_FILE)
+    return fallback if os.path.exists(fallback) else path
 
 
 def format_time(seconds: int) -> str:
@@ -195,6 +202,7 @@ class ShutdownMessageBox(QWidget):
         setCustomStyleSheet(self.container, light_qss, dark_qss)
 
     def _attach_shadow(self) -> None:
+        """为圆角容器挂上系统风格的柔和阴影。"""
         shadow = QGraphicsDropShadowEffect(self.container)
         shadow.setBlurRadius(SHADOW_BLUR)
         shadow.setOffset(0, SHADOW_OFFSET_Y)
@@ -234,7 +242,7 @@ class ShutdownMessageBox(QWidget):
         row = HBoxLayout(spacing=8)
         row.addWidget(self.cancel_btn)
         row.addWidget(self.delay_btn)
-        row.addSpacing(16)
+        row.addSpacing(16)                  # 与关机按钮视觉分隔，避免误触
         row.addWidget(self.shutdown_btn)
         row.addStretch(1)
         row.addWidget(self.accept_btn)
@@ -342,7 +350,6 @@ class MainWindow(QWidget):
 
         # 不可见宿主
         self.setWindowTitle(APP_NAME)
-        self.setWindowIcon(QIcon(resource_path(ICON_FILE)))
         self.setWindowFlags(Qt.Tool)
         self.resize(1, 1)
 
@@ -350,6 +357,12 @@ class MainWindow(QWidget):
         setTheme(Theme.AUTO)
         if sys.platform in ("win32", "darwin"):
             setThemeColor(getSystemAccentColor(), save=False)
+
+        # 监听主题变化：切图标
+        qconfig.themeChanged.connect(self._on_theme_changed)
+
+        # 应用图标（此时主题已确定）
+        self._apply_icon()
 
         # 对话框
         self.message_box = ShutdownMessageBox(countdown)
@@ -376,6 +389,23 @@ class MainWindow(QWidget):
         self.timer.start(TICK_MS)
 
         self.show_reminder()
+
+    # ---------- 图标 ----------
+    def _current_icon_path(self) -> str:
+        """根据当前主题选择图标文件。"""
+        name = ICON_NIGHT_FILE if isDarkTheme() else ICON_FILE
+        return resource_path(name)
+
+    def _apply_icon(self) -> None:
+        """同步窗口图标与托盘图标；TrayIcon 尚未创建时自动跳过。"""
+        icon = QIcon(self._current_icon_path())
+        self.setWindowIcon(icon)
+        if hasattr(self, "tray"):
+            self.tray.setIcon(icon)
+
+    def _on_theme_changed(self, *_):
+        """主题切换后重新应用图标。"""
+        self._apply_icon()
 
     # ---------- 显示 / 隐藏 ----------
     def show_reminder(self) -> None:
