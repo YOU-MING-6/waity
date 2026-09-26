@@ -16,13 +16,13 @@
 
 【代码结构】
 
-    第 1 部分  Config        — 所有可调参数集中在此
-    第 2 部分  Utils         — 通用工具函数
-    第 3 部分  SingleInstance — 保证只运行一个实例
-    第 4 部分  ShutdownMessageBox — 弹窗 UI
-    第 5 部分  TrayIcon      — 系统托盘
-    第 6 部分  MainWindow    — 主控制器
-    第 7 部分  main()        — 程序入口
+    第 1 部分  Config            — 所有可调参数集中在此
+    第 2 部分  Utils             — 通用工具函数
+    第 3 部分  SingleInstance    — 保证只运行一个实例
+    第 4 部分  ShutdownMessageBox— 弹窗 UI
+    第 5 部分  TrayIcon          — 系统托盘
+    第 6 部分  MainWindow        — 主控制器
+    第 7 部分  main()            — 程序入口
 """
 import os
 import sys
@@ -36,13 +36,13 @@ from PySide6.QtGui import QColor, QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QWidget, QSystemTrayIcon, QGraphicsDropShadowEffect,
-    QFrame, QVBoxLayout, QHBoxLayout,
+    QFrame, QVBoxLayout, QHBoxLayout, QWidgetAction,
 )
 
 from qfluentwidgets import (
     Action, BodyLabel, FluentIcon, PrimaryPushButton, ProgressBar,
     PushButton, SubtitleLabel, SystemTrayMenu, Theme,
-    setTheme, setThemeColor, isDarkTheme, qconfig,
+    setTheme, setThemeColor, isDarkTheme,
 )
 from qframelesswindow.utils import getSystemAccentColor
 
@@ -57,7 +57,6 @@ APP_NAME = "shutdowntool"
 APP_DESCRIPTION = "定时关机提示工具"
 
 ICON_FILE = "icon.png"
-ICON_NIGHT_FILE = "icon_night.png"
 
 SOCKET_NAME = f"{APP_ID}_socket"
 LOCK_FILE = f"{APP_ID}.lock"
@@ -88,22 +87,18 @@ INNER_RADIUS = RADIUS - 1
 
 def resource_path(name: str) -> str:
     """
-    返回资源文件（如 icon.png）的绝对路径。
+    返回资源文件的绝对路径，兼容开发环境与 PyInstaller 打包后的环境。
 
-    同时兼容开发环境和 PyInstaller 打包后的环境；
-    若目标文件缺失，会自动回落到 ICON_FILE。
+    打包后资源会被解压到 sys._MEIPASS 指向的临时目录；
+    开发环境则直接使用脚本所在目录。
     """
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    path = os.path.join(base, name)
-    if os.path.exists(path):
-        return path
-    fallback = os.path.join(base, ICON_FILE)
-    return fallback if os.path.exists(fallback) else path
+    return os.path.join(base, name)
 
 
 def format_time(seconds: int) -> str:
     """
-    把秒数格式化成人类易读的字符串。
+    把秒数格式化成易读的字符串。
 
         45   → "45 秒"
         60   → "1 分钟"
@@ -122,10 +117,7 @@ def shutdown_now(delay: int = 0) -> None:
     使用 QProcess.startDetached 而非 os.system，避免阻塞主线程。
     """
     if sys.platform == "win32":
-        QProcess.startDetached(
-            "shutdown",
-            ["/s", "/f", "/t", str(delay)]
-        )
+        QProcess.startDetached("shutdown", ["/s", "/f", "/t", str(delay)])
     else:
         QProcess.startDetached("shutdown", ["-h", "-t", str(delay)])
 
@@ -147,36 +139,6 @@ def center_on_screen(widget: QWidget) -> None:
         geo.x() + (geo.width() - widget.width()) // 2,
         geo.y() + (geo.height() - widget.height()) // 2,
     )
-
-
-def get_system_theme() -> Theme:
-    """
-    读取系统当前的深浅色方案。
-
-    【为什么要写这个函数？】
-        QFluentWidgets 的 setTheme(Theme.AUTO) 在调用那一刻判断系统主题，
-        之后系统切换深浅色时，qconfig 里的主题不会自动更新。
-        所以需要主动读取系统状态并在变化时重新 setTheme。
-
-    读取策略（按优先级）：
-        1. QStyleHints.colorScheme()（Qt 6.5+）
-        2. 从应用程序调色板的亮度粗略判断（老版本 Qt 的兜底方案）
-    """
-    hints = QApplication.styleHints()
-
-    # Qt 6.5+ 提供 colorScheme 枚举
-    if hasattr(hints, "colorScheme"):
-        scheme = hints.colorScheme()
-        if scheme == Qt.ColorScheme.Dark:
-            return Theme.DARK
-        if scheme == Qt.ColorScheme.Light:
-            return Theme.LIGHT
-        # scheme == Qt.ColorScheme.Unknown 时走下面的兜底
-
-    # 兜底方案：从调色板背景色亮度判断
-    palette = QApplication.palette()
-    bg = palette.color(palette.ColorRole.Window)
-    return Theme.DARK if bg.lightness() < 128 else Theme.LIGHT
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -220,17 +182,17 @@ class SingleInstance:
 # ══════════════════════════════════════════════════════════════════════════════
 # 第 4 部分：ShutdownMessageBox —— 弹窗 UI
 # ══════════════════════════════════════════════════════════════════════════════
-# 【视觉结构】（参考 Win11 记事本弹窗）
+# 【视觉结构】
 #
-#     ┌─────────────────────────────────────┐
-#     │  要关机吗？                          │
-#     │  当前为放学时段；计算机将在…          │  ← contentFrame（纯白）
-#     │  ▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░  │
-#     ├─────────────────────────────────────┤  ← 1px 分隔线
-#     │  [已阅][延迟 1 分钟][立即关机]  [取消关机计划] │
-#     │                                     │  ← buttonFrame（浅灰）
-#     └─────────────────────────────────────┘
-# ──────────────────────────────────────────────────────────────────────────────
+# ┌─────────────────────────────────────────────┐
+# │  要关机吗？                                  │
+# │  xxxxx；计算机将在…                          │ ← contentFrame（纯白）
+# │  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░   │
+# ├─────────────────────────────────────────────┤ ← 1px 分隔线
+# │ [已阅][延迟 1 分钟][立即关机]   [取消关机计划] │
+# │                                             │ ← buttonFrame（浅灰）
+# └─────────────────────────────────────────────┘
+# # ──────────────────────────────────────────────────────────────────────────────
 
 class ShutdownMessageBox(QWidget):
     """关机提示对话框。"""
@@ -302,13 +264,7 @@ class ShutdownMessageBox(QWidget):
         self.container.setGraphicsEffect(shadow)
 
     def _apply_style(self) -> None:
-        """
-        应用配色样式。
-
-        两个调用时机：
-            1. 初始化时（构造函数中）
-            2. 主题变化时（MainWindow._on_theme_changed 触发）
-        """
+        """根据当前主题应用配色样式。"""
         if isDarkTheme():
             container_bg = "#2B2B2B"
             container_border = "#3A3A3A"
@@ -396,7 +352,7 @@ class ShutdownMessageBox(QWidget):
             self.total = total
 
         self.contentLabel.setText(
-            f"当前为放学时段；计算机将在 {format_time(self.remaining)}后自动关闭。"
+            f"当前已到放学时段；计算机将在 {format_time(self.remaining)}后自动关闭。"
         )
         self._animate_progress(self._target_progress())
 
@@ -458,8 +414,16 @@ class TrayIcon(QSystemTrayIcon):
 
         menu = SystemTrayMenu(parent=controller)
 
-        self._time_action = Action(FluentIcon.HISTORY, "剩余时间：", controller)
-        menu.addAction(self._time_action)
+        # ---- 剩余时间：纯文本展示项 ----
+        # BodyLabel 是 qfluentwidgets 的正文标签，会跟随主题自动变色
+        self._time_label = BodyLabel("剩余时间：", menu)
+        self._time_label.setContentsMargins(12, 8, 12, 8)
+
+        # QWidgetAction 可以把任意 QWidget 嵌入菜单
+        time_action = QWidgetAction(menu)
+        time_action.setDefaultWidget(self._time_label)
+        menu.addAction(time_action)
+
         menu.addSeparator()
 
         menu.addAction(Action(
@@ -476,16 +440,15 @@ class TrayIcon(QSystemTrayIcon):
     def update_remaining(self, remaining: int) -> None:
         """更新托盘菜单里的剩余时间文字和悬停提示。"""
         text = format_time(remaining)
-        self._time_action.setText(f"剩余时间：{text}")
-        self.setToolTip(f"{APP_NAME}：{text}后自动关机")
-
+        self._time_label.setText(f"剩余时间：{text}")
+        self.setToolTip(f"{text}后自动关机")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 第 6 部分：MainWindow —— 主控制器
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MainWindow(QWidget):
-    """整个程序的中枢：串联对话框、托盘、定时器、单实例、主题监听。"""
+    """整个程序的中枢：串联对话框、托盘、定时器、单实例。"""
 
     def __init__(self, countdown: int, single_instance: SingleInstance) -> None:
         super().__init__()
@@ -498,11 +461,12 @@ class MainWindow(QWidget):
 
         # ---- 宿主窗口（不可见）----
         self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(QIcon(resource_path(ICON_FILE)))
         self.setWindowFlags(Qt.Tool)
         self.resize(1, 1)
 
-        # ---- 主题初始化 ----
-        self._setup_theme()
+        # ---- 主题（只在启动时应用一次）----
+        self._apply_theme()
 
         # ---- UI 组件 ----
         self._setup_message_box(countdown)
@@ -514,78 +478,14 @@ class MainWindow(QWidget):
         self.show_reminder()
 
     # ──────────────────────────────────────────────────────────────────────
-    # 主题与图标
+    # 主题
     # ──────────────────────────────────────────────────────────────────────
 
-    def _setup_theme(self) -> None:
-        """
-        初始化主题并建立“系统主题变化监听”。
-
-        关键三步：
-            1. setTheme(Theme.AUTO) 判断一次当前系统主题；
-            2. 如果系统支持强调色，也同步过去；
-            3. 监听 system colorSchemeChanged，系统主题变了重新应用。
-        """
-        # 应用一次主题（此时 isDarkTheme() 就能反映系统状态了）
+    def _apply_theme(self) -> None:
+        """应用主题：根据启动时的系统状态选择深浅色。"""
         setTheme(Theme.AUTO)
-
-        # 同步系统强调色（Windows / macOS）
         if sys.platform in ("win32", "darwin"):
             setThemeColor(getSystemAccentColor(), save=False)
-
-        # 每当 qconfig 里的主题变化时，刷新图标和对话框配色
-        qconfig.themeChanged.connect(self._on_theme_changed)
-
-        # 监听系统颜色方案变化
-        self._watch_system_color_scheme()
-
-        # 应用一次图标
-        self._apply_icon()
-
-    def _watch_system_color_scheme(self) -> None:
-        """
-        监听系统深浅色变化。
-
-        【为什么要这么做？】
-            setTheme(Theme.AUTO) 只在调用时判断一次系统主题；
-            如果用户在运行中切换系统深浅色，qconfig 里的主题不会自动变。
-            这里监听 Qt 的 colorSchemeChanged 信号，变化时重新 setTheme，
-            从而实现“实时跟随”。
-
-        【兼容性】
-            colorSchemeChanged 是 Qt 6.5+ 新增的信号；
-            老版本 Qt 没有这个信号，用 hasattr 判断即可优雅降级。
-        """
-        hints = QApplication.styleHints()
-        if hasattr(hints, "colorSchemeChanged"):
-            hints.colorSchemeChanged.connect(self._on_system_color_scheme_changed)
-
-    def _on_system_color_scheme_changed(self, *_):
-        """
-        系统颜色方案变化时调用。
-
-        做法：重新 setTheme(Theme.AUTO)，让 qfluentwidgets 重新
-        读取系统状态并更新 qconfig.theme，从而触发 themeChanged。
-        """
-        setTheme(Theme.AUTO)
-
-    def _current_icon_path(self) -> str:
-        """根据当前主题返回对应的图标文件路径。"""
-        name = ICON_NIGHT_FILE if isDarkTheme() else ICON_FILE
-        return resource_path(name)
-
-    def _apply_icon(self) -> None:
-        """把当前主题对应的图标设置到窗口和托盘。"""
-        icon = QIcon(self._current_icon_path())
-        self.setWindowIcon(icon)
-        if hasattr(self, "tray"):
-            self.tray.setIcon(icon)
-
-    def _on_theme_changed(self, *_):
-        """主题变化时刷新图标和对话框配色。"""
-        self._apply_icon()
-        if hasattr(self, "message_box"):
-            self.message_box._apply_style()
 
     # ──────────────────────────────────────────────────────────────────────
     # 组件初始化
@@ -609,7 +509,7 @@ class MainWindow(QWidget):
     def _setup_single_instance_server(self) -> None:
         """启动本地 socket 服务，接收其他实例的唤醒请求。"""
         self.server = QLocalServer(self)
-        self.server.removeServer(SOCKET_NAME)   # 清理上次残留
+        self.server.removeServer(SOCKET_NAME)
         self.server.listen(SOCKET_NAME)
         self.server.newConnection.connect(self._on_new_connection)
 
@@ -691,7 +591,7 @@ class MainWindow(QWidget):
         self._refresh_ui()
 
     def on_shutdown_now(self) -> None:
-        """“立即关机”：停止倒计时，延迟几秒或立即关机。"""
+        """“立即关机”：停止倒计时，延迟几秒后关机。"""
         self.timer.stop()
         shutdown_now(SHUTDOWN_BUFFER_S)
 
