@@ -1,16 +1,16 @@
 """
-Waity - 基于 PySide6 + QFluentWidgets 的定时关机提示工具。
+一款基于 PySide6 + QFluentWidgets 的定时关机提示工具。
 
 行为：
-    - 启动后立即显示置顶的提醒对话框（首次显示时屏幕居中，带窗口阴影）；
+    - 启动后立即显示置顶的提醒对话框；
     - 对话框可拖动；
     - 平滑倒计时进度条；
-    - 点“延迟 1 分钟”固定 +60 秒，不关闭窗口；
     - 托盘常驻，单击图标重新显示对话框。
 """
 import os
 import sys
 import argparse
+import inspect
 
 from PySide6.QtCore import (
     Qt, QTimer, QVariantAnimation, QEasingCurve, QPoint, QProcess,
@@ -19,14 +19,14 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QSystemTrayIcon, QGraphicsDropShadowEffect,
-    QVBoxLayout, QHBoxLayout, QFrame,
+    QApplication, QWidget, QSystemTrayIcon, QGraphicsDropShadowEffect, QFrame,
 )
 
 from qfluentwidgets import (
     Action, BodyLabel, FluentIcon, PrimaryPushButton, ProgressBar,
     PushButton, SubtitleLabel, SystemTrayMenu, Theme,
-    isDarkTheme, setTheme, setThemeColor,
+    VBoxLayout, HBoxLayout, setCustomStyleSheet,
+    setTheme, setThemeColor,
 )
 from qframelesswindow.utils import getSystemAccentColor
 
@@ -34,9 +34,14 @@ from qframelesswindow.utils import getSystemAccentColor
 # ==================================================================
 # 配置
 # ==================================================================
-APP_NAME = "Waity"
-SOCKET_NAME = "waity_socket"
+APP_ID = "shutdowntool"
+APP_NAME = "shutdowntool"
+APP_DESCRIPTION = "定时关机提示工具"
 ICON_FILE = "icon.png"
+
+# 派生标识：跟随 APP_ID，改名后不会再和旧实例抢锁
+SOCKET_NAME = f"{APP_ID}_socket"
+LOCK_FILE = f"{APP_ID}.lock"
 
 WIDTH = 600                      # 对话框内容宽度
 TICK_MS = 1000                   # 倒计时 / 进度条动画步长
@@ -51,6 +56,11 @@ SHADOW_MARGIN = 24               # 窗口四周为阴影预留的透明边距（
 SHADOW_BLUR = 24                 # 阴影模糊半径
 SHADOW_OFFSET_Y = 4              # 阴影向下偏移
 SHADOW_COLOR = QColor(0, 0, 0, 90)   # 阴影颜色（半透明黑）
+
+# 进度条是否支持内置 duration 动画（启动时自动探测）
+_PROGRESS_SUPPORTS_DURATION = (
+    "duration" in inspect.signature(ProgressBar.setValue).parameters
+)
 
 
 # ==================================================================
@@ -106,7 +116,7 @@ class SingleInstance:
     def __init__(self) -> None:
         lock_path = os.path.join(
             QStandardPaths.writableLocation(QStandardPaths.TempLocation),
-            f"{SOCKET_NAME}.lock",
+            LOCK_FILE,
         )
         self._lock = QLockFile(lock_path)
 
@@ -152,7 +162,7 @@ class ShutdownMessageBox(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground, True)
 
         # 外层留出阴影边距
-        outer = QVBoxLayout(self)
+        outer = VBoxLayout(self)
         outer.setContentsMargins(
             SHADOW_MARGIN, SHADOW_MARGIN, SHADOW_MARGIN, SHADOW_MARGIN
         )
@@ -167,17 +177,24 @@ class ShutdownMessageBox(QWidget):
         outer.addWidget(self.container)
 
     def _apply_style(self) -> None:
-        if isDarkTheme():
-            bg, border = "#2B2B2B", "rgba(255, 255, 255, 0.08)"
-        else:
-            bg, border = "#F3F3F3", "rgba(0, 0, 0, 0.06)"
-        self.container.setStyleSheet(
-            f"#shutdownContainer {{ background-color: {bg};"
-            f" border: 1px solid {border}; border-radius: 8px; }}"
+        """深浅色两套 QSS 交给 setCustomStyleSheet，跟随主题自动切换。"""
+        light_qss = (
+            "#shutdownContainer {"
+            "  background-color: #F3F3F3;"
+            "  border: 1px solid rgba(0, 0, 0, 0.06);"
+            "  border-radius: 8px;"
+            "}"
         )
+        dark_qss = (
+            "#shutdownContainer {"
+            "  background-color: #2B2B2B;"
+            "  border: 1px solid rgba(255, 255, 255, 0.08);"
+            "  border-radius: 8px;"
+            "}"
+        )
+        setCustomStyleSheet(self.container, light_qss, dark_qss)
 
     def _attach_shadow(self) -> None:
-        """为圆角容器挂上系统风格的柔和阴影。"""
         shadow = QGraphicsDropShadowEffect(self.container)
         shadow.setBlurRadius(SHADOW_BLUR)
         shadow.setOffset(0, SHADOW_OFFSET_Y)
@@ -186,9 +203,8 @@ class ShutdownMessageBox(QWidget):
 
     # ---------- 内容 ----------
     def _setup_content(self) -> None:
-        layout = QVBoxLayout(self.container)
+        layout = VBoxLayout(self.container, spacing=12)
         layout.setContentsMargins(24, 24, 24, 20)
-        layout.setSpacing(12)
 
         self.contentLabel = BodyLabel("", self.container)
         self.contentLabel.setWordWrap(True)
@@ -205,14 +221,20 @@ class ShutdownMessageBox(QWidget):
 
     def _setup_buttons(self) -> None:
         self.accept_btn = PrimaryPushButton(FluentIcon.ACCEPT, "已阅", self.container)
-        self.shutdown_btn = PushButton(FluentIcon.POWER_BUTTON, "立即关机", self.container)
-        self.delay_btn = PushButton(FluentIcon.DATE_TIME, "延迟 1 分钟", self.container)
-        self.cancel_btn = PushButton(FluentIcon.CLOSE, "取消关机计划", self.container)
+        self.shutdown_btn = PushButton(
+            FluentIcon.POWER_BUTTON, "立即关机", self.container
+        )
+        self.delay_btn = PushButton(
+            FluentIcon.HISTORY, "延迟 1 分钟", self.container
+        )
+        self.cancel_btn = PushButton(
+            FluentIcon.CLOSE, "取消关机计划", self.container
+        )
 
-        row = QHBoxLayout()
-        row.setSpacing(8)
+        row = HBoxLayout(spacing=8)
         row.addWidget(self.cancel_btn)
         row.addWidget(self.delay_btn)
+        row.addSpacing(16)
         row.addWidget(self.shutdown_btn)
         row.addStretch(1)
         row.addWidget(self.accept_btn)
@@ -240,7 +262,15 @@ class ShutdownMessageBox(QWidget):
         return max(0, min(100, round(self.remaining * 100 / self.total)))
 
     def _animate_progress(self, target: int) -> None:
-        """让进度在 TICK_MS 内线性过渡到目标值，避免每秒跳变。"""
+        """
+        让进度在 TICK_MS 内平滑过渡到目标值。
+        - 若 ProgressBar.setValue 支持 duration 参数，直接用内置动画；
+        - 否则回落到 QVariantAnimation。
+        """
+        if _PROGRESS_SUPPORTS_DURATION:
+            self.progressBar.setValue(target, duration=TICK_MS)
+            return
+
         if self._progress_anim is None:
             self._progress_anim = QVariantAnimation(self)
             self._progress_anim.setEasingCurve(QEasingCurve.Type.Linear)
@@ -284,7 +314,7 @@ class TrayIcon(QSystemTrayIcon):
         menu.addAction(self._time_action)
         menu.addSeparator()
         menu.addAction(Action(
-            FluentIcon.DATE_TIME, "延迟 1 分钟",
+            FluentIcon.SYNC, "延迟 1 分钟",
             controller, triggered=controller.on_delay_clicked,
         ))
         menu.addAction(Action(
@@ -418,7 +448,7 @@ class MainWindow(QWidget):
 # 入口
 # ==================================================================
 def main() -> None:
-    parser = argparse.ArgumentParser(description=APP_NAME)
+    parser = argparse.ArgumentParser(description=APP_DESCRIPTION)
     parser.add_argument("--countdown", type=int, default=15,
                         help="默认倒计时时长（秒）")
     args = parser.parse_args()
