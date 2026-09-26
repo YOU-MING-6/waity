@@ -11,7 +11,6 @@
 import os
 import sys
 import argparse
-import inspect
 
 from PySide6.QtCore import (
     Qt, QTimer, QVariantAnimation, QEasingCurve, QPoint, QProcess,
@@ -60,11 +59,6 @@ SHADOW_MARGIN = 24               # 窗口四周为阴影预留的透明边距（
 SHADOW_BLUR = 24                 # 阴影模糊半径
 SHADOW_OFFSET_Y = 4              # 阴影向下偏移
 SHADOW_COLOR = QColor(0, 0, 0, 90)   # 阴影颜色（半透明黑）
-
-# 进度条是否支持内置 duration 动画（启动时自动探测）
-_PROGRESS_SUPPORTS_DURATION = (
-    "duration" in inspect.signature(ProgressBar.setValue).parameters
-)
 
 
 # ==================================================================
@@ -272,15 +266,7 @@ class ShutdownMessageBox(QWidget):
         return max(0, min(100, round(self.remaining * 100 / self.total)))
 
     def _animate_progress(self, target: int) -> None:
-        """
-        让进度在 TICK_MS 内平滑过渡到目标值。
-        - 若 ProgressBar.setValue 支持 duration 参数，直接用内置动画；
-        - 否则回落到 QVariantAnimation。
-        """
-        if _PROGRESS_SUPPORTS_DURATION:
-            self.progressBar.setValue(target, duration=TICK_MS)
-            return
-
+        """让进度在 TICK_MS 内平滑过渡到目标值。"""
         if self._progress_anim is None:
             self._progress_anim = QVariantAnimation(self)
             self._progress_anim.setEasingCurve(QEasingCurve.Type.Linear)
