@@ -2,7 +2,8 @@
 一款基于 PySide6 + QFluentWidgets 的定时关机提示工具。
 
 行为：
-    - 启动后立即显示置顶的提醒对话框；
+    - 启动后立即显示置顶的提醒对话框（Win11 风格）；
+    - 对话框使用系统阴影 + 打开/关闭动画；
     - 对话框可拖动；
     - 平滑倒计时进度条；
     - 托盘常驻，单击图标重新显示对话框；
@@ -14,13 +15,13 @@ import argparse
 
 from PySide6.QtCore import (
     Qt, QTimer, QVariantAnimation, QEasingCurve, QPoint, QProcess,
-    QLockFile, QStandardPaths,
+    QLockFile, QStandardPaths, QAbstractAnimation,
 )
 from PySide6.QtGui import QColor, QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QWidget, QSystemTrayIcon, QGraphicsDropShadowEffect,
-    QFrame, QVBoxLayout, QHBoxLayout,
+    QFrame, QVBoxLayout, QHBoxLayout, QDialog,
 )
 
 from qfluentwidgets import (
@@ -38,33 +39,35 @@ APP_ID = "shutdowntool"
 APP_NAME = "shutdowntool"
 APP_DESCRIPTION = "定时关机提示工具"
 
-ICON_FILE = "icon.png"                 # 浅色主题图标
-ICON_NIGHT_FILE = "icon_night.png"     # 深色主题图标
+ICON_FILE = "icon.png"
+ICON_NIGHT_FILE = "icon_night.png"
 
-# 派生标识：跟随 APP_ID，改名后不会再和旧实例抢锁
 SOCKET_NAME = f"{APP_ID}_socket"
 LOCK_FILE = f"{APP_ID}.lock"
 
-WIDTH = 600                      # 对话框内容宽度
+WIDTH = 460                      # 对话框内容宽度
 TICK_MS = 1000                   # 倒计时 / 进度条动画步长
 CLOSE_DELAY_MS = 500             # 关闭对话框后退出前的延迟
-SHUTDOWN_BUFFER_S = 5            # “立即关机”缓冲
+SHUTDOWN_BUFFER_S = 3            # “立即关机”缓冲
 DELAY_S = 60                     # 每次延迟增加的秒数
-NOTIFY_TIMEOUT_MS = 500          # 单实例消息超时
-LOCK_TIMEOUT_MS = 100            # 单实例加锁超时
+NOTIFY_TIMEOUT_MS = 500
+LOCK_TIMEOUT_MS = 100
 
-# 窗口阴影
-SHADOW_MARGIN = 24               # 窗口四周为阴影预留的透明边距（px）
-SHADOW_BLUR = 24                 # 阴影模糊半径
-SHADOW_OFFSET_Y = 4              # 阴影向下偏移
-SHADOW_COLOR = QColor(0, 0, 0, 90)   # 阴影颜色（半透明黑）
+# 打开 / 关闭动画
+OPEN_DURATION_MS = 180
+CLOSE_DURATION_MS = 140
+
+# 阴影（外层留白 + DropShadow）
+SHADOW_MARGIN = 20
+SHADOW_BLUR = 24
+SHADOW_OFFSET_Y = 4
+SHADOW_COLOR = QColor(0, 0, 0, 80)
 
 
 # ==================================================================
 # 工具
 # ==================================================================
 def resource_path(name: str) -> str:
-    """兼容 PyInstaller 与开发环境；缺失时回落到 ICON_FILE。"""
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     path = os.path.join(base, name)
     if os.path.exists(path):
@@ -74,7 +77,6 @@ def resource_path(name: str) -> str:
 
 
 def format_time(seconds: int) -> str:
-    """'X 分钟' / 'X 分 X 秒' / 'X 秒'"""
     if seconds >= 60:
         m, s = divmod(seconds, 60)
         return f"{m} 分钟" if s == 0 else f"{m} 分 {s} 秒"
@@ -82,7 +84,6 @@ def format_time(seconds: int) -> str:
 
 
 def shutdown_now(delay: int = 0) -> None:
-    """异步执行系统关机，避免阻塞主线程。"""
     if sys.platform == "win32":
         QProcess.startDetached("shutdown", ["/s", "/f", "/t", str(delay)])
     else:
@@ -90,13 +91,11 @@ def shutdown_now(delay: int = 0) -> None:
 
 
 def cancel_shutdown() -> None:
-    """异步取消已计划的关机（Windows）。"""
     if sys.platform == "win32":
         QProcess.startDetached("shutdown", ["/a"])
 
 
 def center_on_screen(widget: QWidget) -> None:
-    """将顶层 widget 居中到所在屏幕。"""
     screen = widget.screen() or QApplication.primaryScreen()
     if screen is None:
         return
@@ -112,8 +111,6 @@ def center_on_screen(widget: QWidget) -> None:
 # 单实例
 # ==================================================================
 class SingleInstance:
-    """QLockFile 保证唯一实例；QLocalSocket 用于唤起已运行的实例。"""
-
     def __init__(self) -> None:
         lock_path = os.path.join(
             QStandardPaths.writableLocation(QStandardPaths.TempLocation),
@@ -137,17 +134,16 @@ class SingleInstance:
 
 
 # ==================================================================
-# ShutdownMessageBox（独立顶层窗口，无遮罩，带阴影）
+# ShutdownMessageBox
 # ==================================================================
-class ShutdownMessageBox(QWidget):
-    """关机提示对话框：圆角、可拖动、带窗口阴影、含平滑进度条。"""
-
+class ShutdownMessageBox(QDialog):
     def __init__(self, countdown: int) -> None:
         super().__init__()
         self.remaining = countdown
         self.total = countdown
         self._progress_anim: QVariantAnimation | None = None
         self._drag_offset: QPoint | None = None
+        self._closing = False
 
         self._setup_window()
         self._setup_content()
@@ -156,19 +152,20 @@ class ShutdownMessageBox(QWidget):
 
     # ---------- 窗口 ----------
     def _setup_window(self) -> None:
+        # 使用 QDialog，让 Qt 走系统对话框行为（激活、Z 序、动画基座）
         self.setWindowFlags(
-            Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+            Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
         )
-        # 透明背景仅用于让阴影边距与圆角外的区域真正透明
         self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setModal(False)
 
-        # 外层留出阴影边距
+        # 外层留出阴影空间
         outer = QVBoxLayout(self)
         outer.setContentsMargins(
             SHADOW_MARGIN, SHADOW_MARGIN, SHADOW_MARGIN, SHADOW_MARGIN
         )
+        outer.setSpacing(0)
 
-        # 圆角背景容器
         self.container = QFrame(self)
         self.container.setObjectName("shutdownContainer")
         self.container.setFixedWidth(WIDTH)
@@ -178,18 +175,32 @@ class ShutdownMessageBox(QWidget):
         outer.addWidget(self.container)
 
     def _apply_style(self) -> None:
-        """主题切换时由 MainWindow._on_theme_changed 触发刷新。"""
         if isDarkTheme():
-            bg, border = "#2B2B2B", "rgba(255, 255, 255, 0.08)"
+            bg = "#2B2B2B"
+            footer_bg = "#323232"
+            border = "rgba(255, 255, 255, 0.08)"
+            divider = "rgba(255, 255, 255, 0.08)"
         else:
-            bg, border = "#F3F3F3", "rgba(0, 0, 0, 0.06)"
-        self.container.setStyleSheet(
-            f"#shutdownContainer {{ background-color: {bg};"
-            f" border: 1px solid {border}; border-radius: 8px; }}"
-        )
+            bg = "#FFFFFF"
+            footer_bg = "#F9F9F9"
+            border = "rgba(0, 0, 0, 0.06)"
+            divider = "rgba(0, 0, 0, 0.08)"
+
+        self.container.setStyleSheet(f"""
+            #shutdownContainer {{
+                background-color: {bg};
+                border: 1px solid {border};
+                border-radius: 8px;
+            }}
+            #footerArea {{
+                background-color: {footer_bg};
+                border-top: 1px solid {divider};
+                border-bottom-left-radius: 8px;
+                border-bottom-right-radius: 8px;
+            }}
+        """)
 
     def _attach_shadow(self) -> None:
-        """为圆角容器挂上系统风格的柔和阴影。"""
         shadow = QGraphicsDropShadowEffect(self.container)
         shadow.setBlurRadius(SHADOW_BLUR)
         shadow.setOffset(0, SHADOW_OFFSET_Y)
@@ -199,45 +210,49 @@ class ShutdownMessageBox(QWidget):
     # ---------- 内容 ----------
     def _setup_content(self) -> None:
         layout = QVBoxLayout(self.container)
-        layout.setSpacing(12)
-        layout.setContentsMargins(24, 24, 24, 20)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        self.contentLabel = BodyLabel("", self.container)
+        # 内容区
+        content = QFrame(self.container)
+        content.setObjectName("contentArea")
+        cl = QVBoxLayout(content)
+        cl.setContentsMargins(24, 20, 24, 20)
+        cl.setSpacing(10)
+
+        cl.addWidget(SubtitleLabel("要关机吗？", content))
+
+        self.contentLabel = BodyLabel("", content)
         self.contentLabel.setWordWrap(True)
+        cl.addWidget(self.contentLabel)
 
-        self.progressBar = ProgressBar(self.container)
+        self.progressBar = ProgressBar(content)
         self.progressBar.setValue(100)
+        cl.addWidget(self.progressBar)
 
-        layout.addWidget(SubtitleLabel("要关机吗？", self.container))
-        layout.addWidget(self.contentLabel)
-        layout.addSpacing(4)
-        layout.addWidget(self.progressBar)
+        layout.addWidget(content)
 
-        self._contentLayout = layout
+        # 底部按钮区
+        footer = QFrame(self.container)
+        footer.setObjectName("footerArea")
+        fl = QHBoxLayout(footer)
+        fl.setContentsMargins(16, 12, 16, 12)
+        fl.setSpacing(8)
+
+        self._footer_layout = fl
+        layout.addWidget(footer)
 
     def _setup_buttons(self) -> None:
-        self.accept_btn = PrimaryPushButton(FluentIcon.ACCEPT, "已阅", self.container)
-        self.shutdown_btn = PushButton(
-            FluentIcon.POWER_BUTTON, "立即关机", self.container
-        )
-        self.delay_btn = PushButton(
-            FluentIcon.HISTORY, "延迟 1 分钟", self.container
-        )
-        self.cancel_btn = PushButton(
-            FluentIcon.CLOSE, "取消关机计划", self.container
-        )
+        self.cancel_btn = PushButton(FluentIcon.CLOSE, "取消关机计划")
+        self.delay_btn = PushButton(FluentIcon.HISTORY, "延迟 1 分钟")
+        self.shutdown_btn = PushButton(FluentIcon.POWER_BUTTON, "立即关机")
+        self.accept_btn = PrimaryPushButton(FluentIcon.ACCEPT, "已阅")
 
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        row.addWidget(self.cancel_btn)
-        row.addWidget(self.delay_btn)
-        row.addSpacing(16)                  # 与关机按钮视觉分隔，避免误触
-        row.addWidget(self.shutdown_btn)
-        row.addStretch(1)
-        row.addWidget(self.accept_btn)
-
-        self._contentLayout.addSpacing(8)
-        self._contentLayout.addLayout(row)
+        self._footer_layout.addStretch(1)
+        self._footer_layout.addWidget(self.cancel_btn)
+        self._footer_layout.addWidget(self.delay_btn)
+        self._footer_layout.addWidget(self.shutdown_btn)
+        self._footer_layout.addWidget(self.accept_btn)
 
     # ---------- 内容 / 进度 ----------
     def update_content(
@@ -259,7 +274,6 @@ class ShutdownMessageBox(QWidget):
         return max(0, min(100, round(self.remaining * 100 / self.total)))
 
     def _animate_progress(self, target: int) -> None:
-        """让进度在 TICK_MS 内平滑过渡到目标值。"""
         if self._progress_anim is None:
             self._progress_anim = QVariantAnimation(self)
             self._progress_anim.setEasingCurve(QEasingCurve.Type.Linear)
@@ -271,6 +285,36 @@ class ShutdownMessageBox(QWidget):
         self._progress_anim.setStartValue(self.progressBar.value())
         self._progress_anim.setEndValue(target)
         self._progress_anim.start()
+
+    # ---------- 打开 / 关闭动画 ----------
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._closing:
+            return
+        # 淡入
+        self.setWindowOpacity(0.0)
+        anim = QPropertyAnimation(self, b"windowOpacity", self)
+        anim.setDuration(OPEN_DURATION_MS)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+
+    def closeEvent(self, event) -> None:
+        # 已经播过关闭动画：真正关闭
+        if self._closing:
+            event.accept()
+            return
+        # 第一次 close：拦截，播淡出后再关
+        event.ignore()
+        self._closing = True
+        anim = QPropertyAnimation(self, b"windowOpacity", self)
+        anim.setDuration(CLOSE_DURATION_MS)
+        anim.setStartValue(self.windowOpacity())
+        anim.setEndValue(0.0)
+        anim.setEasingCurve(QEasingCurve.Type.InCubic)
+        anim.finished.connect(self.close)
+        anim.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
 
     # ---------- 拖动 ----------
     def mousePressEvent(self, event) -> None:
@@ -373,25 +417,25 @@ class MainWindow(QWidget):
 
     # ---------- 图标 ----------
     def _current_icon_path(self) -> str:
-        """根据当前主题选择图标文件。"""
         name = ICON_NIGHT_FILE if isDarkTheme() else ICON_FILE
         return resource_path(name)
 
     def _apply_icon(self) -> None:
-        """同步窗口图标与托盘图标；TrayIcon 尚未创建时自动跳过。"""
         icon = QIcon(self._current_icon_path())
         self.setWindowIcon(icon)
         if hasattr(self, "tray"):
             self.tray.setIcon(icon)
 
     def _on_theme_changed(self, *_):
-        """主题切换后重新应用图标，并刷新对话框背景。"""
         self._apply_icon()
         if hasattr(self, "message_box"):
             self.message_box._apply_style()
 
     # ---------- 显示 / 隐藏 ----------
     def show_reminder(self) -> None:
+        # 若上次关闭，重建 _closing 状态以允许再次显示
+        self.message_box._closing = False
+
         if not self._centered:
             center_on_screen(self.message_box)
             self._centered = True
@@ -446,7 +490,7 @@ class MainWindow(QWidget):
     def cancel_shutdown(self) -> None:
         cancel_shutdown()
         self.message_box.close()
-        QTimer.singleShot(CLOSE_DELAY_MS, self._quit)
+        QTimer.singleShot(CLOSE_DELAY_MS + CLOSE_DURATION_MS, self._quit)
 
     # ---------- 退出 ----------
     def _quit(self) -> None:
