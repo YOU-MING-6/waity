@@ -448,7 +448,7 @@ class TrayIcon(QSystemTrayIcon):
 
         menu = SystemTrayMenu(parent=controller)
 
-        self._time_action = Action(FluentIcon.POWERBUTTON, "剩余时间：", controller)
+        self._time_action = Action(FluentIcon.INFO, "剩余时间：", controller)
         menu.addAction(self._time_action)
 
         menu.addSeparator()
@@ -458,10 +458,10 @@ class TrayIcon(QSystemTrayIcon):
             controller, triggered=controller.on_delay_clicked,
         ))
         menu.addAction(Action(
-            FluentIcon.POWERBUTTON, "立即关机",
+            FluentIcon.POWER_BUTTON, "立即关机",
             controller, triggered=controller.on_shutdown_now,
         ))
-        
+
         menu.addSeparator()
 
         menu.addAction(Action(
