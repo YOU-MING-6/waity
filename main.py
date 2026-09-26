@@ -78,7 +78,7 @@ INNER_RADIUS = RADIUS - 1
 
 # ---------- 边缘指示条 ----------
 EDGE_WIDTH      = 10          # 条宽（像素）
-EDGE_HEIGHT     = 220        # 条高
+EDGE_HEIGHT     = 340        # 条高
 EDGE_ANIM_MS    = 220        # 淡入淡出动画时长
 
 # 系统色拿不到时的回退强调色
@@ -437,35 +437,31 @@ class ShutdownMessageBox(QWidget):
         super().mouseReleaseEvent(event)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 第 5 部分：EdgeIndicator —— 屏幕右边缘的竖向进度条
-# ══════════════════════════════════════════════════════════════════════════════
-
 class EdgeIndicator(QWidget):
     """
     贴在屏幕右边缘的竖向进度条。
 
-    视觉（浅色主题 / 深色主题都成立）：
+    视觉（浅色 / 深色主题都成立）：
         ┌──┐
         │  │ ← 顶部圆角
         │  │
-        │  │ ← “剩余”部分：跟随主题的灰底
-        │  │   浅色 → #E5E5E5，深色 → #4A4A4A
+        │  │ ← “剩余”底灰：浅色 → #E5E5E5，深色 → #4A4A4A
+        │  │   启动时按当前主题定一次，运行中不再变化
         ├──┤ ← 分界线（无描边，仅颜色差）
         │  │
         │  │
-        │  │ ← “已过”部分：系统强调色（高亮）
-        │  │
+        │  │ ← “剩余”高亮：系统强调色（同样启动时缓存）
+        │  │   高度 = 剩余比例 × 条高
+        │  │   剩余 100% → 整条，剩余 0% → 整条变灰
         │  │
         └──┘ ← 底部圆角
               ↑
         右侧齐平，紧贴屏幕边缘
 
     行为：
-        · 剩余时间比例 → set_progress(0.0~1.0)
+        · set_progress(剩余比例) → 重绘
         · 单击 → clicked 信号
-        · 悬停 → 系统色略微提亮，暗示可点击
-        · 主题切换 → 下一帧自动重绘（每次 paintEvent 重新取主题状态）
+        · 悬停 → 系统色略微提亮
     """
 
     clicked = Signal()
@@ -480,22 +476,27 @@ class EdgeIndicator(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
 
-        # 尺寸：宽度就是这里的 EDGE_WIDTH
+        # 尺寸 —— 宽度由 Config.EDGE_WIDTH 决定
         self.setFixedSize(EDGE_WIDTH, EDGE_HEIGHT)
         self.setCursor(Qt.PointingHandCursor)
         self.setToolTip("点击重新显示关机提示")
 
-        # 系统强调色只需取一次并缓存（macOS/Win 上有效，Linux 可能无效）
+        # 1) 系统强调色（Linux 上可能无效，需要回退）
         accent = getSystemAccentColor()
         self._accent = accent if accent.isValid() else QColor(EDGE_COLOR_FALLBACK)
 
+        # 2) 未走过部分的底色，按当前主题取一次
+        self._rest_color = QColor(
+            EDGE_REST_DARK if isDarkTheme() else EDGE_REST_LIGHT
+        )
+
         # 状态
-        self._progress = 1.0        # 剩余比例：1.0 = 刚开始，0.0 = 到点
+        self._progress = 1.0        # 剩余比例：1.0 = 满，0.0 = 空
         self._hover = False
 
     # ---------- 对外接口 ----------
     def set_progress(self, ratio: float) -> None:
-        """ratio 为“剩余时间占总时间的比例”，0.0~1.0。"""
+        """ratio = 剩余时间 / 总时间，0.0 ~ 1.0。"""
         ratio = max(0.0, min(1.0, ratio))
         if abs(ratio - self._progress) < 1e-4:
             return
@@ -526,8 +527,7 @@ class EdgeIndicator(QWidget):
         w, h = self.width(), self.height()
         radius = w / 2.0
 
-        # ---- 构造“仅左侧圆角”的裁剪路径 ----
-        # 右上 → 上边 → 左上圆弧 → 左侧直边 → 左下圆弧 → 下边 → 右侧闭合
+        # ── 1. 裁剪成“仅左侧圆角”的形状 ──────────────────────────
         path = QPainterPath()
         path.moveTo(w, 0)
         path.lineTo(radius, 0)
@@ -537,25 +537,18 @@ class EdgeIndicator(QWidget):
                    2 * radius, 2 * radius, 180, 90)
         path.lineTo(w, h)
         path.closeSubpath()
-
         p.setClipPath(path)
 
-        # ---- 1) 底色：剩余部分 ----
-        # 颜色取决于当前主题，每次重绘重新判断，主题切换自然生效
-        rest_color = QColor(EDGE_REST_DARK if isDarkTheme() else EDGE_REST_LIGHT)
-        p.fillRect(0, 0, w, h, rest_color)
+        # ── 2. 铺底：启动时缓存的灰（不随主题实时变化）──────────
+        p.fillRect(0, 0, w, h, self._rest_color)
 
-        # ---- 2) 高亮：已过部分（自下而上填充，使用系统强调色）----
-        past_ratio = 1.0 - self._progress
-        if past_ratio > 0:
-            past_h = h * past_ratio
+        # ── 3. 高亮：系统色，从底部向上撑起，高度 = progress × h ─
+        if self._progress > 0:
+            fill_h = h * self._progress
             accent = QColor(self._accent)
             if self._hover:
-                accent = accent.lighter(115)   # 悬停时轻微提亮
-            p.fillRect(
-                QRectF(0, h - past_h, w, past_h),
-                accent,
-            )
+                accent = accent.lighter(115)
+            p.fillRect(QRectF(0, h - fill_h, w, fill_h), accent)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
