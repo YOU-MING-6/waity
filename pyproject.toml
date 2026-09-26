@@ -1,7 +1,7 @@
 [project]
-name = "waity"
+name = "shutdowntool"
 version = "0.1.0"
-description = "Add your description here"
+description = "Scheduled Shutdown Reminder Tool"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
