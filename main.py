@@ -10,7 +10,7 @@
 
         · 点“已阅”         → 暂时关闭窗口，倒计时继续
         · 点“延迟 1 分钟”  → 倒计时 +60 秒，窗口不关闭
-        · 点“立即关机”     → 5 秒后关机（留一点缓冲时间）
+        · 点“立即关机”     → 关机（可留一点缓冲时间）
         · 点“取消关机计划” → 撤销关机，退出程序
         · 单击托盘图标     → 重新显示窗口
 
@@ -36,7 +36,7 @@ from PySide6.QtGui import QColor, QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QWidget, QSystemTrayIcon, QGraphicsDropShadowEffect,
-    QFrame, QVBoxLayout, QHBoxLayout, QWidgetAction,
+    QFrame, QVBoxLayout, QHBoxLayout,
 )
 
 from qfluentwidgets import (
@@ -99,10 +99,6 @@ def resource_path(name: str) -> str:
 def format_time(seconds: int) -> str:
     """
     把秒数格式化成易读的字符串。
-
-        45   → "45 秒"
-        60   → "1 分钟"
-        90   → "1 分 30 秒"
     """
     if seconds >= 60:
         m, s = divmod(seconds, 60)
@@ -139,6 +135,44 @@ def center_on_screen(widget: QWidget) -> None:
         geo.x() + (geo.width() - widget.width()) // 2,
         geo.y() + (geo.height() - widget.height()) // 2,
     )
+
+
+def play_startup_sound() -> None:
+    """
+    程序成功启动后播放 Windows 11 的 UAC 提示音。
+    非 Windows 平台静默返回，播放失败也不抛异常（不影响主流程）。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import winsound
+    except ImportError:
+        return
+
+    # 播放系统自带的声音文件
+    media_dir = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "Media")
+    for name in (
+        "Windows User Account Control.wav",
+        "Windows User Account Control (Windows 10).wav",
+    ):
+        wav = os.path.join(media_dir, name)
+        if os.path.isfile(wav):
+            try:
+                winsound.PlaySound(
+                    wav,
+                    winsound.SND_FILENAME
+                    | winsound.SND_ASYNC      # 异步播放，不阻塞主线程
+                    | winsound.SND_NODEFAULT, # 找不到文件就别放默认音
+                )
+                return
+            except RuntimeError:
+                pass
+
+    # 2) 回退：系统默认的“信息提示音”，听感接近 UAC
+    try:
+        winsound.MessageBeep(winsound.MB_ICONASTERISK)
+    except Exception:
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -352,7 +386,7 @@ class ShutdownMessageBox(QWidget):
             self.total = total
 
         self.contentLabel.setText(
-            f"当前已到放学时段；计算机将在 {format_time(self.remaining)}后自动关闭。"
+            f"当前为放学时段；计算机将在 {format_time(self.remaining)}后自动关闭。"
         )
         self._animate_progress(self._target_progress())
 
@@ -414,20 +448,12 @@ class TrayIcon(QSystemTrayIcon):
 
         menu = SystemTrayMenu(parent=controller)
 
-        # ---- 剩余时间：纯文本展示项 ----
-        # BodyLabel 是 qfluentwidgets 的正文标签，会跟随主题自动变色
-        self._time_label = BodyLabel("剩余时间：", menu)
-        self._time_label.setContentsMargins(12, 8, 12, 8)
-
-        # QWidgetAction 可以把任意 QWidget 嵌入菜单
-        time_action = QWidgetAction(menu)
-        time_action.setDefaultWidget(self._time_label)
-        menu.addAction(time_action)
-
+        self._time_action = Action(FluentIcon.TIME, "剩余时间：", controller)
+        menu.addAction(self._time_action)
         menu.addSeparator()
 
         menu.addAction(Action(
-            FluentIcon.SYNC, "延迟 1 分钟",
+            FluentIcon.HISTORY, "延迟 1 分钟",
             controller, triggered=controller.on_delay_clicked,
         ))
         menu.addAction(Action(
@@ -440,8 +466,9 @@ class TrayIcon(QSystemTrayIcon):
     def update_remaining(self, remaining: int) -> None:
         """更新托盘菜单里的剩余时间文字和悬停提示。"""
         text = format_time(remaining)
-        self._time_label.setText(f"剩余时间：{text}")
-        self.setToolTip(f"{text}后自动关机")
+        self._time_action.setText(f"剩余时间：{text}")
+        self.setToolTip(f"{text}后将自动关机")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 第 6 部分：MainWindow —— 主控制器
@@ -591,7 +618,7 @@ class MainWindow(QWidget):
         self._refresh_ui()
 
     def on_shutdown_now(self) -> None:
-        """“立即关机”：停止倒计时，延迟几秒后关机。"""
+        """“立即关机”：停止倒计时，关机。"""
         self.timer.stop()
         shutdown_now(SHUTDOWN_BUFFER_S)
 
@@ -647,7 +674,10 @@ def main() -> None:
     # ---- 4. 创建主窗口 ----
     window = MainWindow(args.countdown, si)
 
-    # ---- 5. 进入事件循环 ----
+    # ---- 5. 启动成功，播放提示音 ----
+    play_startup_sound()
+
+    # ---- 6. 进入事件循环 ----
     sys.exit(app.exec())
 
 
