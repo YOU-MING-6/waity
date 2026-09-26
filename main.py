@@ -77,11 +77,12 @@ RADIUS = 8
 INNER_RADIUS = RADIUS - 1
 
 # ---------- 边缘指示条 ----------
-EDGE_WIDTH = 6
-EDGE_HEIGHT = 220
-EDGE_MARGIN = 6
-EDGE_COLOR = "#0078D4"
-EDGE_ANIM_MS = 220
+EDGE_WIDTH      = 6        # 条宽（像素）
+EDGE_HEIGHT     = 220      # 条高
+EDGE_COLOR      = "#0078D4"  # 系统色拿不到时的回退色
+EDGE_ALPHA_PAST = 0.8      # “已过”部分的不透明度
+EDGE_ALPHA_REST = 0.2      # “剩余”部分的不透明度
+EDGE_ANIM_MS    = 220      # 淡入淡出动画时长
 
 # ---------- 窗口隐藏 / 显示动画 ----------
 HIDE_ANIM_MS = 260
@@ -439,28 +440,56 @@ class ShutdownMessageBox(QWidget):
 class EdgeIndicator(QWidget):
     """
     贴在屏幕右边缘的竖向进度条。
-    · 高度随剩余时间比例从下往上填充
-    · 单击 → 发出 clicked 信号（由主控重开窗口）
-    · 不抢焦点、不进任务栏
+
+    视觉：
+        ┌──┐
+        │  │ ← 顶部圆角
+        │  │
+        │  │ ← “剩余”部分：系统色 20% 不透明度
+        │  │
+        ├──┤ ← 分界线（无描边，仅颜色差）
+        │  │
+        │  │
+        │  │ ← “已过”部分：系统色 80% 不透明度
+        │  │
+        │  │
+        └──┘ ← 底部圆角
+              ↑
+        右侧齐平，紧贴屏幕边缘
+
+    行为：
+        · 剩余时间比例 → set_progress(0.0~1.0)
+        · 单击 → clicked 信号
+        · 悬停 → 整体略微提亮，提示“可点击”
     """
 
     clicked = Signal()
 
     def __init__(self) -> None:
         super().__init__()
+
+        # 无边框 / 置顶 / 不抢焦点、不进任务栏
         self.setWindowFlags(
             Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+
         self.setFixedSize(EDGE_WIDTH, EDGE_HEIGHT)
         self.setCursor(Qt.PointingHandCursor)
         self.setToolTip("点击重新显示关机提示")
-        self._progress = 1.0
+
+        # 缓存系统强调色（每次 paintEvent 都取会有一点开销）
+        accent = getSystemAccentColor()
+        self._accent = accent if accent.isValid() else QColor(EDGE_COLOR)
+
+        # 状态
+        self._progress = 1.0        # 剩余比例，1.0 = 刚开始，0.0 = 到点
         self._hover = False
 
     # ---------- 对外接口 ----------
     def set_progress(self, ratio: float) -> None:
+        """ratio 为“剩余时间占总时间的比例”，0.0~1.0。"""
         ratio = max(0.0, min(1.0, ratio))
         if abs(ratio - self._progress) < 1e-4:
             return
@@ -486,39 +515,48 @@ class EdgeIndicator(QWidget):
     # ---------- 绘制 ----------
     def paintEvent(self, event):
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.Antialiasing, True)
 
-        r = QRectF(0, 0, self.width(), self.height())
-        radius = min(r.width(), r.height()) / 2
+        w, h = self.width(), self.height()
+        radius = w / 2.0
 
+        # ---- 构造“仅左侧圆角”的路径 ----
+        # 起点放在右上角，顺时针绕一圈：
+        #   右上 → 向左到左上圆弧起点 → 左上圆角 → 左侧直边 → 左下圆角
+        #   → 向右到底部 → 右侧直边回到起点
         path = QPainterPath()
-        path.addRoundedRect(r, radius, radius)
+        path.moveTo(w, 0)                                  # 右上角
+        path.lineTo(radius, 0)                             # 上边（到左上弧起点）
+        path.arcTo(0, 0, 2 * radius, 2 * radius, 90, 90)   # 左上圆角
+        path.lineTo(0, h - radius)                         # 左侧直边
+        path.arcTo(0, h - 2 * radius,
+                   2 * radius, 2 * radius, 180, 90)        # 左下圆角
+        path.lineTo(w, h)                                  # 下边
+        path.closeSubpath()                                # 右侧直边（自动闭合）
+
         p.setClipPath(path)
 
-        # 背景
-        if isDarkTheme():
-            bg = QColor(255, 255, 255, 55 if self._hover else 30)
-        else:
-            bg = QColor(0, 0, 0, 55 if self._hover else 25)
-        p.fillRect(r, bg)
+        # ---- 颜色准备 ----
+        # 悬停时整体提亮一点点，不改变透明度语义
+        base = QColor(self._accent)
+        if self._hover:
+            base = base.lighter(112)
 
-        # 进度填充（自下而上）
-        if self._progress > 0:
-            h = r.height() * self._progress
-            fill_rect = QRectF(r.left(), r.bottom() - h, r.width(), h)
-            color = QColor(EDGE_COLOR)
-            if self._hover:
-                color = color.lighter(115)
-            p.fillRect(fill_rect, color)
+        # ---- 1) 剩余部分（顶部，20% 不透明度）----
+        rest = QColor(base)
+        rest.setAlphaF(EDGE_ALPHA_REST)
+        p.fillRect(0, 0, w, h, rest)
 
-        # 边框
-        p.setClipping(False)
-        border = QColor(255, 255, 255, 70) if isDarkTheme() else QColor(0, 0, 0, 60)
-        pen = QPen(border)
-        pen.setWidthF(1.0)
-        p.setPen(pen)
-        p.setBrush(Qt.NoBrush)
-        p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
+        # ---- 2) 已过部分（从底部向上填充，80% 不透明度）----
+        past_ratio = 1.0 - self._progress
+        if past_ratio > 0:
+            past_h = h * past_ratio
+            past = QColor(base)
+            past.setAlphaF(EDGE_ALPHA_PAST)
+            p.fillRect(
+                QRectF(0, h - past_h, w, past_h),
+                past,
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -687,60 +725,48 @@ class MainWindow(QWidget):
         self._anim_state = "idle"
         self._show_edge_indicator()
 
-    # ──────────────────────────────────────────────────────────────────────
-    # 边缘指示条的定位与出现 / 消失
-    # ──────────────────────────────────────────────────────────────────────
     def _show_edge_indicator(self) -> None:
+        """让边缘条贴到屏幕右边缘，并淡入。"""
         screen = self.message_box.screen() or QApplication.primaryScreen()
         if screen is None:
             return
         geo = screen.availableGeometry()
-
-        target_x = geo.right() - EDGE_WIDTH - EDGE_MARGIN + 1
+    
+        # 关键：右侧 +0 边距，窗口最右一列像素正好压住屏幕最右一列
+        target_x = geo.right() - EDGE_WIDTH + 1
+        # 竖直居中
         target_y = geo.top() + (geo.height() - EDGE_HEIGHT) // 2
-
-        # 同步当前进度
+    
         self.edge_indicator.set_progress(self._progress_ratio())
-
-        # 从屏幕外滑入
-        start_pos = QPoint(geo.right() + 4, target_y)
-        self.edge_indicator.move(start_pos)
+        self.edge_indicator.move(target_x, target_y)
+    
+        # 淡入
+        self.edge_indicator.setWindowOpacity(0.0)
         self.edge_indicator.show()
         self.edge_indicator.raise_()
-
-        anim = QPropertyAnimation(self.edge_indicator, b"pos", self)
+    
+        anim = QPropertyAnimation(self.edge_indicator, b"windowOpacity", self)
         anim.setDuration(EDGE_ANIM_MS)
-        anim.setStartValue(start_pos)
-        anim.setEndValue(QPoint(target_x, target_y))
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
         anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         anim.start()
-        self._edge_anim = anim    # 持引用防 GC
-
+        self._edge_anim = anim
+    
     def _hide_edge_indicator(self) -> None:
+        """边缘条淡出后隐藏。"""
         if not self.edge_indicator.isVisible():
             return
-
-        anim = QParallelAnimationGroup(self)
-
-        a_op = QPropertyAnimation(self.edge_indicator, b"windowOpacity", self)
-        a_op.setDuration(EDGE_ANIM_MS)
-        a_op.setStartValue(1.0)
-        a_op.setEndValue(0.0)
-        a_op.setEasingCurve(QEasingCurve.Type.InCubic)
-
-        cur = self.edge_indicator.pos()
-        a_pos = QPropertyAnimation(self.edge_indicator, b"pos", self)
-        a_pos.setDuration(EDGE_ANIM_MS)
-        a_pos.setStartValue(cur)
-        a_pos.setEndValue(cur + QPoint(20, 0))
-        a_pos.setEasingCurve(QEasingCurve.Type.InCubic)
-
-        anim.addAnimation(a_op)
-        anim.addAnimation(a_pos)
+    
+        anim = QPropertyAnimation(self.edge_indicator, b"windowOpacity", self)
+        anim.setDuration(EDGE_ANIM_MS)
+        anim.setStartValue(self.edge_indicator.windowOpacity())
+        anim.setEndValue(0.0)
+        anim.setEasingCurve(QEasingCurve.Type.InCubic)
         anim.finished.connect(self._on_edge_hide_done)
         anim.start()
         self._edge_anim = anim
-
+    
     def _on_edge_hide_done(self) -> None:
         self.edge_indicator.hide()
         self.edge_indicator.setWindowOpacity(1.0)
