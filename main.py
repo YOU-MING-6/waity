@@ -20,13 +20,14 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QSystemTrayIcon, QGraphicsDropShadowEffect, QFrame,
+    QApplication, QWidget, QSystemTrayIcon, QGraphicsDropShadowEffect,
+    QFrame, QHBoxLayout,
 )
 
 from qfluentwidgets import (
     Action, BodyLabel, FluentIcon, PrimaryPushButton, ProgressBar,
     PushButton, SubtitleLabel, SystemTrayMenu, Theme,
-    VBoxLayout, HBoxLayout, setCustomStyleSheet,
+    VBoxLayout, setCustomStyleSheet,
     setTheme, setThemeColor, isDarkTheme, qconfig,
 )
 from qframelesswindow.utils import getSystemAccentColor
@@ -239,7 +240,8 @@ class ShutdownMessageBox(QWidget):
             FluentIcon.CLOSE, "取消关机计划", self.container
         )
 
-        row = HBoxLayout(spacing=8)
+        row = QHBoxLayout()
+        row.setSpacing(8)
         row.addWidget(self.cancel_btn)
         row.addWidget(self.delay_btn)
         row.addSpacing(16)                  # 与关机按钮视觉分隔，避免误触
