@@ -20,13 +20,12 @@ from PySide6.QtGui import QColor, QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QWidget, QSystemTrayIcon, QGraphicsDropShadowEffect,
-    QFrame, QHBoxLayout,
+    QFrame, QVBoxLayout, QHBoxLayout,
 )
 
 from qfluentwidgets import (
     Action, BodyLabel, FluentIcon, PrimaryPushButton, ProgressBar,
     PushButton, SubtitleLabel, SystemTrayMenu, Theme,
-    VBoxLayout, setCustomStyleSheet,
     setTheme, setThemeColor, isDarkTheme, qconfig,
 )
 from qframelesswindow.utils import getSystemAccentColor
@@ -164,7 +163,7 @@ class ShutdownMessageBox(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground, True)
 
         # 外层留出阴影边距
-        outer = VBoxLayout(self)
+        outer = QVBoxLayout(self)
         outer.setContentsMargins(
             SHADOW_MARGIN, SHADOW_MARGIN, SHADOW_MARGIN, SHADOW_MARGIN
         )
@@ -179,22 +178,15 @@ class ShutdownMessageBox(QWidget):
         outer.addWidget(self.container)
 
     def _apply_style(self) -> None:
-        """深浅色两套 QSS 交给 setCustomStyleSheet，跟随主题自动切换。"""
-        light_qss = (
-            "#shutdownContainer {"
-            "  background-color: #F3F3F3;"
-            "  border: 1px solid rgba(0, 0, 0, 0.06);"
-            "  border-radius: 8px;"
-            "}"
+        """主题切换时由 MainWindow._on_theme_changed 触发刷新。"""
+        if isDarkTheme():
+            bg, border = "#2B2B2B", "rgba(255, 255, 255, 0.08)"
+        else:
+            bg, border = "#F3F3F3", "rgba(0, 0, 0, 0.06)"
+        self.container.setStyleSheet(
+            f"#shutdownContainer {{ background-color: {bg};"
+            f" border: 1px solid {border}; border-radius: 8px; }}"
         )
-        dark_qss = (
-            "#shutdownContainer {"
-            "  background-color: #2B2B2B;"
-            "  border: 1px solid rgba(255, 255, 255, 0.08);"
-            "  border-radius: 8px;"
-            "}"
-        )
-        setCustomStyleSheet(self.container, light_qss, dark_qss)
 
     def _attach_shadow(self) -> None:
         """为圆角容器挂上系统风格的柔和阴影。"""
@@ -206,7 +198,8 @@ class ShutdownMessageBox(QWidget):
 
     # ---------- 内容 ----------
     def _setup_content(self) -> None:
-        layout = VBoxLayout(self.container, spacing=12)
+        layout = QVBoxLayout(self.container)
+        layout.setSpacing(12)
         layout.setContentsMargins(24, 24, 24, 20)
 
         self.contentLabel = BodyLabel("", self.container)
@@ -346,7 +339,7 @@ class MainWindow(QWidget):
         if sys.platform in ("win32", "darwin"):
             setThemeColor(getSystemAccentColor(), save=False)
 
-        # 监听主题变化：切图标
+        # 监听主题变化：切图标 + 重刷对话框 QSS
         qconfig.themeChanged.connect(self._on_theme_changed)
 
         # 应用图标（此时主题已确定）
@@ -392,8 +385,10 @@ class MainWindow(QWidget):
             self.tray.setIcon(icon)
 
     def _on_theme_changed(self, *_):
-        """主题切换后重新应用图标。"""
+        """主题切换后重新应用图标，并刷新对话框背景。"""
         self._apply_icon()
+        if hasattr(self, "message_box"):
+            self.message_box._apply_style()
 
     # ---------- 显示 / 隐藏 ----------
     def show_reminder(self) -> None:
